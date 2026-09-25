@@ -530,6 +530,15 @@ extern "C" {
                                    FILE * file,
               struct llama_model_params   params);
 
+    // Load a model from a GGUF in memory
+    // With a load mode that does not mmap (NONE, MLOCK, DIRECT_IO), the data is copied and the buffer can be freed after this call
+    // Otherwise, CPU tensors can point into the buffer, so it must stay valid and unchanged until the model is freed
+    // Split models and LoRA adapters are not supported
+    LLAMA_API struct llama_model * llama_model_load_from_buffer(
+                             const void * data,
+                                 size_t   size,
+              struct llama_model_params   params);
+
     // Load a model from multiple splits (support custom naming scheme)
     // The paths must be in the correct order
     LLAMA_API struct llama_model * llama_model_load_from_splits(

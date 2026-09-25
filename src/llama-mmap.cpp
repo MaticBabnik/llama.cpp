@@ -401,15 +401,24 @@ llama_file::llama_file(const char * fname, const char * mode, const bool use_dir
 
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 
+llama_file::llama_file(const void * data, size_t size) : mem_data((const uint8_t *) data), mem_size(size) {
+    GGML_ASSERT(data != nullptr);
+}
+
 llama_file::~llama_file() = default;
 
-size_t llama_file::tell() const { return pimpl->tell(); }
-size_t llama_file::size() const { return pimpl->size; }
+const void * llama_file::data() const { return mem_data; }
 
-size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
-bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+size_t llama_file::tell() const { return mem_data ? mem_pos : pimpl->tell(); }
+size_t llama_file::size() const { return mem_data ? mem_size : pimpl->size; }
+
+size_t llama_file::read_alignment() const { return mem_data ? 1 : pimpl->read_alignment(); }
+bool llama_file::has_direct_io() const { return mem_data ? false : pimpl->has_direct_io(); }
 
 int llama_file::file_id() const {
+    if (mem_data) {
+        return -1;
+    }
 #ifdef _WIN32
     return _fileno(pimpl->fp);
 #else
@@ -424,18 +433,65 @@ int llama_file::file_id() const {
 #endif
 }
 
-void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
-void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+void llama_file::seek(size_t offset, int whence) const {
+    if (!mem_data) {
+        pimpl->seek(offset, whence);
+        return;
+    }
+    size_t base = 0;
+    switch (whence) {
+        case SEEK_SET: base = 0;        break;
+        case SEEK_CUR: base = mem_pos;  break;
+        case SEEK_END: base = mem_size; break;
+        default: throw std::runtime_error("invalid seek whence");
+    }
+    if (offset > mem_size - base) {
+        throw std::runtime_error("seek out of buffer bounds");
+    }
+    mem_pos = base + offset;
+}
+
+void llama_file::read_raw(void * ptr, size_t len) {
+    if (!mem_data) {
+        pimpl->read_raw(ptr, len);
+        return;
+    }
+    if (len > mem_size - mem_pos) {
+        throw std::runtime_error("unexpectedly reached end of buffer");
+    }
+    memcpy(ptr, mem_data + mem_pos, len);
+    mem_pos += len;
+}
+
+void llama_file::read_raw_unsafe(void * ptr, size_t len) {
+    if (mem_data) {
+        read_raw(ptr, len);
+        return;
+    }
 #ifdef _WIN32
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+    pimpl->read_raw(ptr, len);
 #else
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
+    pimpl->read_raw_unsafe(ptr, len);
 #endif
+}
 
-uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
+uint32_t llama_file::read_u32() {
+    if (mem_data) {
+        uint32_t val;
+        read_raw(&val, sizeof(val));
+        return val;
+    }
+    return pimpl->read_u32();
+}
 
-void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
-void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
+void llama_file::write_raw(const void * ptr, size_t len) const {
+    if (mem_data) {
+        throw std::runtime_error("cannot write to a memory-backed file");
+    }
+    pimpl->write_raw(ptr, len);
+}
+
+void llama_file::write_u32(uint32_t val) const { write_raw(&val, sizeof(val)); }
 
 // llama_mmap
 
@@ -663,14 +719,25 @@ struct llama_mmap::impl {
     size_t size;
 };
 
-llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa, const ranges & lazy_ranges) {
+    if (file->data()) {
+        // weights are read-only, same as a PROT_READ mapping
+        mem_addr = const_cast<void *>(file->data());
+        mem_size = file->size();
+        return;
+    }
+    pimpl = std::make_unique<impl>(file, prefetch, numa, lazy_ranges);
+}
 llama_mmap::~llama_mmap() = default;
 
-size_t llama_mmap::size() const { return pimpl->size; }
-void * llama_mmap::addr() const { return pimpl->addr; }
+size_t llama_mmap::size() const { return pimpl ? pimpl->size : mem_size; }
+void * llama_mmap::addr() const { return pimpl ? pimpl->addr : mem_addr; }
 
-void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::unmap_fragment(size_t first, size_t last) {
+    if (pimpl) {
+        pimpl->unmap_fragment(first, last);
+    }
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

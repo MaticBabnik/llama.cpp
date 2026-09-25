@@ -462,8 +462,9 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
-    GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        const void * buf = nullptr, size_t buf_size = 0) {
+    GGML_ASSERT((gguf_ctx != nullptr) + (file != nullptr) + (buf != nullptr) == 1);
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
@@ -482,7 +483,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     tensor_data_params tensor_params = { seed, stdev };
     llama_model_ptr model(gguf_ctx != nullptr ?
         llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params) :
-        llama_model_load_from_file_ptr(file, model_params));
+        file != nullptr ? llama_model_load_from_file_ptr(file, model_params) :
+        llama_model_load_from_buffer(buf, buf_size, model_params));
     if (!model) {
         throw std::runtime_error("failed to create llama model");
     }
@@ -870,10 +872,23 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode);
                         const std::vector<float> logits_roundtrip = get_logits(
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+
+                        // load the same GGUF again from memory, the buffer must outlive the model
+                        struct alignas(64) block { uint8_t b[64]; };
+                        fseek(file, 0, SEEK_END);
+                        const size_t file_size = ftell(file);
+                        rewind(file);
+                        std::vector<block> buf((file_size + sizeof(block) - 1) / sizeof(block));
+                        GGML_ASSERT(fread(buf.data(), 1, file_size, file) == file_size);
+                        auto model_and_ctx_buf = get_model_and_ctx(nullptr, nullptr, seed, stdev, dc.devs, dc.split_mode, encode, buf.data(), file_size);
+                        const std::vector<float> logits_buf = get_logits(
+                            model_and_ctx_buf.first.get(), model_and_ctx_buf.second.get(), tokens, encode);
+
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
+                        GGML_ASSERT(logits_buf.size() == logits_dev.size());
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {
-                            if (logits_roundtrip[i] != logits_dev[i]) {
+                            if (logits_roundtrip[i] != logits_dev[i] || logits_buf[i] != logits_dev[i]) {
                                 test_ok = false;
                                 status_roundtrip = "\033[1;31mFAIL\033[0m";
                                 break;

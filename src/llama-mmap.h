@@ -17,7 +17,10 @@ using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 struct llama_file {
     llama_file(const char * fname, const char * mode, bool use_direct_io = false);
     llama_file(FILE * file);
+    llama_file(const void * data, size_t size); // read-only view of caller memory, no copy
     ~llama_file();
+
+    const void * data() const; // nullptr unless memory-backed
 
     size_t tell() const;
     size_t size() const;
@@ -39,6 +42,10 @@ struct llama_file {
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    const uint8_t * mem_data = nullptr;
+    size_t mem_size = 0;
+    mutable size_t mem_pos = 0;
 };
 
 struct llama_mmap {
@@ -60,6 +67,10 @@ struct llama_mmap {
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // set when wrapping a memory-backed llama_file, nothing is mapped
+    void * mem_addr = nullptr;
+    size_t mem_size = 0;
 };
 
 struct llama_mlock {

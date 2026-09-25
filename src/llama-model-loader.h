@@ -178,6 +178,8 @@ struct llama_model_loader {
         const std::string & fname,
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,
+        const void * buf_data,
+        size_t buf_size,
         llama_load_mode load_mode,
         bool check_tensors,
         bool no_alloc,

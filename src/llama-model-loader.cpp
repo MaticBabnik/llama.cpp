@@ -536,6 +536,8 @@ llama_model_loader::llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits,
         FILE * file,
+        const void * buf_data,
+        size_t buf_size,
         llama_load_mode load_mode,
         bool check_tensors,
         bool no_alloc,
@@ -672,30 +674,56 @@ llama_model_loader::llama_model_loader(
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
         }
-    } else if (file != nullptr) {
+    } else if (file != nullptr || buf_data != nullptr) {
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {
             /*.no_alloc = */ true,
             /*.ctx      = */ &ctx,
         };
 
-        metadata_ptr.reset(gguf_init_from_file_ptr(file, params));
+        if (file != nullptr) {
+            metadata_ptr.reset(gguf_init_from_file_ptr(file, params));
+        } else {
+            metadata_ptr.reset(gguf_init_from_buffer(buf_data, buf_size, params));
+        }
         metadata = metadata_ptr.get();
         if (metadata == nullptr) {
-            throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
+            throw std::runtime_error(format("%s: failed to load model from %s", __func__, file ? "file pointer" : "buffer"));
         }
 
         // mmap places tensors at their file offsets, so an embedded GGUF must be aligned in the file too
         const size_t tensor_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
-        if (use_mmap && gguf_get_data_offset(metadata) % tensor_align != 0) {
+        if (use_mmap && file != nullptr && gguf_get_data_offset(metadata) % tensor_align != 0) {
             throw std::runtime_error(format("%s: GGUF data section at file offset %zu is not %zu byte aligned, cannot mmap",
                 __func__, gguf_get_data_offset(metadata), tensor_align));
+        }
+        // a buffer is used in place, so the data section address must be aligned
+        if (use_mmap && buf_data != nullptr && ((uintptr_t) buf_data + gguf_get_data_offset(metadata)) % tensor_align != 0) {
+            throw std::runtime_error(format("%s: GGUF data section in buffer is not %zu byte aligned, align the buffer or use LLAMA_LOAD_MODE_NONE to copy it",
+                __func__, tensor_align));
         }
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
-        files.emplace_back(new llama_file(file));
+        // without a path, other files cannot be found
+        uint16_t n_split = 0;
+        get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+        if (n_split > 1) {
+            throw std::runtime_error(format("%s: split models (%d splits) cannot be loaded from a %s, merge the splits first",
+                __func__, n_split, file ? "file pointer" : "buffer"));
+        }
+        std::string general_type;
+        get_key(llm_kv(LLM_KV_GENERAL_TYPE), general_type, false);
+        if (general_type == "adapter") {
+            throw std::runtime_error(format("%s: GGUF is a LoRA adapter, it needs a base model and cannot be loaded as a model", __func__));
+        }
+
+        if (file != nullptr) {
+            files.emplace_back(new llama_file(file));
+        } else {
+            files.emplace_back(new llama_file(buf_data, buf_size));
+        }
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -720,7 +748,7 @@ llama_model_loader::llama_model_loader(
     fver = (enum llama_fver) gguf_get_version(metadata);
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
-            __func__, n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
+            __func__, n_kv, n_tensors, !fname.empty() ? fname.c_str() : file ? "(file*)" : "(buffer)", llama_file_version_name(fver));
 
     // determine file type based on the number of tensors for each quantization and print meta data
     // TODO: make optional
