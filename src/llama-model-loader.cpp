@@ -692,15 +692,23 @@ llama_model_loader::llama_model_loader(
         }
 
         // mmap places tensors at their file offsets, so an embedded GGUF must be aligned in the file too
-        const size_t tensor_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
-        if (use_mmap && file != nullptr && gguf_get_data_offset(metadata) % tensor_align != 0) {
-            throw std::runtime_error(format("%s: GGUF data section at file offset %zu is not %zu byte aligned, cannot mmap",
-                __func__, gguf_get_data_offset(metadata), tensor_align));
-        }
         // a buffer is used in place, so the data section address must be aligned
-        if (use_mmap && buf_data != nullptr && ((uintptr_t) buf_data + gguf_get_data_offset(metadata)) % tensor_align != 0) {
-            throw std::runtime_error(format("%s: GGUF data section in buffer is not %zu byte aligned, align the buffer or use LLAMA_LOAD_MODE_NONE to copy it",
-                __func__, tensor_align));
+        const size_t tensor_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+        const size_t data_offs = gguf_get_data_offset(metadata);
+        const bool misaligned = file != nullptr
+            ? data_offs % tensor_align != 0
+            : ((uintptr_t) buf_data + data_offs) % tensor_align != 0;
+        if (use_mmap && misaligned) {
+            if (load_mode != LLAMA_LOAD_MODE_AUTO) {
+                if (file != nullptr) {
+                    throw std::runtime_error(format("%s: GGUF data section at file offset %zu is not %zu byte aligned, cannot mmap",
+                        __func__, data_offs, tensor_align));
+                }
+                throw std::runtime_error(format("%s: GGUF data section in buffer is not %zu byte aligned, cannot use it in place",
+                    __func__, tensor_align));
+            }
+            LLAMA_LOG_WARN("%s: GGUF data section is not %zu byte aligned, cannot mmap, weights will be copied\n", __func__, tensor_align);
+            use_mmap = false;
         }
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
@@ -723,6 +731,7 @@ llama_model_loader::llama_model_loader(
             files.emplace_back(new llama_file(file));
         } else {
             files.emplace_back(new llama_file(buf_data, buf_size));
+            from_buffer = true;
         }
         contexts.emplace_back(ctx);
 
@@ -1437,7 +1446,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
-    if (use_mmap || lazy.any()) {
+    if (use_mmap || lazy.any() || from_buffer) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
@@ -1552,7 +1561,7 @@ bool llama_model_loader::load_all_data(
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        if (use_mmap || from_buffer || check_tensors) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1665,7 +1674,7 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        const bool from_mapping = use_mmap || from_buffer || lazy.has(cur);
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);

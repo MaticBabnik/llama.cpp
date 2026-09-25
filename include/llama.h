@@ -533,6 +533,7 @@ extern "C" {
     // Load a model from a GGUF in memory
     // With a load mode that does not mmap (NONE, MLOCK, DIRECT_IO), the data is copied and the buffer can be freed after this call
     // Otherwise, CPU tensors can point into the buffer, so it must stay valid and unchanged until the model is freed
+    // Using the buffer in place needs the GGUF data section to be 32 byte aligned in memory: AUTO falls back to copying, MMAP fails
     // Split models and LoRA adapters are not supported
     LLAMA_API struct llama_model * llama_model_load_from_buffer(
                              const void * data,

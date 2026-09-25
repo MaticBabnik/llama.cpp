@@ -80,6 +80,7 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    bool from_buffer = false; // weights are read from the caller buffer in place, in every load mode
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
